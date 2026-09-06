@@ -38,11 +38,11 @@ This model (K0.3.3) is the final version of the 42.6M-parameter architecture. De
 
 ## Files
 
-- **`main.py`** — Initial training script. Trains the tokenizer if one doesn't exist yet, tokenizes the corpus into resumable shards, and trains the model from scratch with checkpointing, periodic evaluation, and early stopping.
-- **`pull.py`** — Staged dataset preparation script. Streams data from multiple Hugging Face datasets without downloading everything at once, tracks how much of each source has already been used so re-running it for a new stage only fetches new documents, and merges + shuffles all data collected so far into a single training file.
-- **`reeducate.py`** — Continual training script, used from the second stage onward. Loads a checkpoint produced by a previous stage, applies a reduced ("warm-restart") learning rate, and continues training on the enlarged cumulative dataset. Written for Kaggle notebooks, where the previous stage's checkpoint and the updated dataset are provided as input datasets.
-- **`generate.py`** — Interactive inference script for plain text completion.
-- **`test_generate.py`** — Same as `generate.py`, with an added logging mode: prompts and completions from a benchmark run can be saved, under a user-given title, to a text file for comparison across model versions.
+- main.py — Initial training script. Trains the tokenizer if one doesn't exist yet, tokenizes the corpus into resumable shards, and trains the model from scratch with checkpointing, periodic evaluation, and early stopping.
+- pull.py — Staged dataset preparation script. Streams data from multiple Hugging Face datasets without downloading everything at once, tracks how much of each source has already been used so re-running it for a new stage only fetches new documents, and merges + shuffles all data collected so far into a single training file.
+- reeducate.py — Continual training script, used from the second stage onward. Loads a checkpoint produced by a previous stage, applies a reduced ("warm-restart") learning rate, and continues training on the enlarged cumulative dataset. Written for Kaggle notebooks, where the previous stage's checkpoint and the updated dataset are provided as input datasets.
+- generate.py — Interactive inference script for plain text completion.
+- test_generate.py — Same as generate.py, with an added logging mode: prompts and completions from a benchmark run can be saved, under a user-given title, to a text file for comparison across model versions.
 
 ## Known limitations
 
