@@ -17,7 +17,16 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # --- YEREL DOSYA YOLLARI ---
 TOKENIZER_FILE = 'tokenizer_16k.json'
-BEST_MODEL_PATH = 'K0.3.1/42M_model1_st200M.pth'
+BEST_MODEL_PATH = 'K0.3.3/42M_model3_st800M_repacked.pth'
+
+# --- TEST LOG DOSYASI ---
+# Her "kaydet" dediğinde bu dosyanın SONUNA yeni bir başlıklı blok eklenir
+# (Word dosyandaki "1. General Knowledge...", "2. Logic..." gibi bloklar
+# tam olarak bu düzende birikir). Dosya yoksa otomatik oluşturulur.
+TEST_LOG_FILE = 'test_sonuclari.txt'
+
+# --- YAZI HIZI (typewriter efekti, saniye/karakter) ---
+TYPE_DELAY = 0.008
 
 if not os.path.exists(TOKENIZER_FILE):
     raise FileNotFoundError(f"Tokenizer bulunamadı: {TOKENIZER_FILE}")
@@ -29,7 +38,6 @@ vocab_size = tokenizer.get_vocab_size()
 encode = lambda s: tokenizer.encode(s).ids
 decode = lambda l: tokenizer.decode(l)
 
-# Özel token'ları üretim esnasında engelleme
 _SPECIAL_TOKEN_CANDIDATES = [
     "<unk>", "[UNK]", "<pad>", "[PAD]", "<s>", "</s>",
     "[BOS]", "[EOS]", "<|endoftext|>", "[CLS]", "[SEP]", "[MASK]",
@@ -37,7 +45,7 @@ _SPECIAL_TOKEN_CANDIDATES = [
 _vocab = tokenizer.get_vocab()
 BANNED_TOKEN_IDS = sorted({_vocab[t] for t in _SPECIAL_TOKEN_CANDIDATES if t in _vocab})
 
-# ================== MODEL MİMARİSİ ==================
+# ================== MODEL MİMARİSİ (main.py İLE BİREBİR AYNI) ==================
 class MultiHeadAttention(nn.Module):
     def __init__(self, n_embd, n_head, dropout):
         super().__init__()
@@ -56,13 +64,10 @@ class MultiHeadAttention(nn.Module):
         q = q.view(B, T, self.n_head, self.head_size).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_size).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_size).transpose(1, 2)
-
         out = F.scaled_dot_product_attention(
-            q, k, v,
-            is_causal=True,
+            q, k, v, is_causal=True,
             dropout_p=self.dropout_p if self.training else 0.0,
         )
-
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_dropout(self.proj(out))
 
@@ -70,12 +75,9 @@ class FeedFoward(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.GELU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(dropout),
+            nn.Linear(n_embd, 4 * n_embd), nn.GELU(),
+            nn.Linear(4 * n_embd, n_embd), nn.Dropout(dropout),
         )
-
     def forward(self, x):
         return self.net(x)
 
@@ -85,7 +87,6 @@ class Block(nn.Module):
         self.sa = MultiHeadAttention(n_embd, n_head, dropout)
         self.ffwd = FeedFoward(n_embd)
         self.ln1, self.ln2 = nn.LayerNorm(n_embd), nn.LayerNorm(n_embd)
-
     def forward(self, x):
         x = x + self.sa(self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
@@ -109,10 +110,12 @@ class BigramLanguageModel(nn.Module):
 
     @torch.no_grad()
     def complete_text(self, prompt_text, max_new_tokens=150, temperature=0.75,
-                      top_k=40, top_p=0.9, repetition_penalty=1.2, stop_at_sentence=True):
+                       top_k=40, top_p=0.9, repetition_penalty=1.2, stop_at_sentence=True):
         """
-        Düz metin tamamlama (GPT-2 stili). 
-        stop_at_sentence=True yapıldığında son yarım kalan cümleyi temizler.
+        Düz metin tamamlama (GPT-2 stili). SADECE üretir ve döner - ekrana
+        basmaz, kayıt yapmaz. Yazdırma/kayıt işini dışarıdaki döngü yapıyor
+        (böylece hem normal modda hem test modunda aynı typewriter/log
+        mantığı tek yerden yönetiliyor).
         """
         prompt_ids = encode(prompt_text)
         idx = torch.tensor([prompt_ids], dtype=torch.long, device=device)
@@ -123,11 +126,9 @@ class BigramLanguageModel(nn.Module):
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] / temperature
 
-            # 1. Yasaklı token'ları engelle
             if BANNED_TOKEN_IDS:
                 logits[0, BANNED_TOKEN_IDS] = -float('Inf')
 
-            # 2. Repetition Penalty
             if repetition_penalty is not None and repetition_penalty != 1.0:
                 for prev_token in set(idx[0].tolist()):
                     if logits[0, prev_token] < 0:
@@ -135,72 +136,50 @@ class BigramLanguageModel(nn.Module):
                     else:
                         logits[0, prev_token] /= repetition_penalty
 
-            # 3. Top-K Filtreleme
             if top_k is not None and top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
 
-            # 4. Top-P (Nucleus) Filtreleme
             if top_p is not None and top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
                 sorted_probs = F.softmax(sorted_logits, dim=-1)
                 cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-
                 sorted_indices_to_remove = cumulative_probs > top_p
                 sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
                 sorted_indices_to_remove[:, 0] = False
-
                 indices_to_remove = sorted_indices[0][sorted_indices_to_remove[0]]
                 logits[0, indices_to_remove] = -float('Inf')
 
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
-            
-            token_id = idx_next.item()
-            generated_ids.append(token_id)
+            generated_ids.append(idx_next.item())
             idx = torch.cat((idx, idx_next), dim=1)
 
-        # Ham üretilen metin
         full_generated_text = decode(generated_ids)
 
-        # Cümle Sonu Temizleme Mantığı (Nokta, Ünlem, Soru İşareti)
         if stop_at_sentence:
             end_marks = ['.', '!', '?']
             last_mark_idx = max(full_generated_text.rfind(mark) for mark in end_marks)
-            
-            # Eğer üretilen metinde en az bir nokta/cümle sonu varsa oraya kadar kes
-            if last_mark_idx != -1:
-                cleaned_text = full_generated_text[:last_mark_idx + 1]
-            else:
-                cleaned_text = full_generated_text
+            cleaned_text = full_generated_text[:last_mark_idx + 1] if last_mark_idx != -1 else full_generated_text
         else:
             cleaned_text = full_generated_text
 
-        # Ekrana temizlenmiş çıktıyı bas
-        sys.stdout.write(cleaned_text)
-        sys.stdout.flush()
-
-        print("\n")
         return cleaned_text
+
 
 def resolve_pth_path(path):
     if os.path.isfile(path):
         return path
-
     if not os.path.isdir(path):
         raise FileNotFoundError(f"Ne dosya ne klasör bulunamadı: {path}")
-
     real_root = None
     for root, _, files in os.walk(path):
         if 'data.pkl' in files:
             real_root = root
             break
-
     if real_root is None:
         raise FileNotFoundError(f"'{path}' klasörünün içinde 'data.pkl' bulunamadı.")
-
     repacked_path = path.rstrip('/\\') + '_repacked.pth'
-
     if not os.path.exists(repacked_path):
         print(f"[i] '{path}' klasörü .pth dosyasına dönüştürülüyor...")
         archive_name = 'archive'
@@ -211,29 +190,69 @@ def resolve_pth_path(path):
                     rel_path = os.path.relpath(full_path, real_root)
                     arcname = os.path.join(archive_name, rel_path).replace('\\', '/')
                     zf.write(full_path, arcname)
-
     return repacked_path
 
 
-# --- MODEL YÜKLEME VE ÇALIŞTIRMA ---
+def stream_print(text):
+    """ChatGPT tarzı DEĞİL, GPT-2 demo tarzı: prompt'un TAM DEVAMI gibi akar.
+    Ayrı bir '>>' satırı açmaz, kullanıcının yazdığı satırın hemen ardından
+    (gerekirse aralarına boşluk koyarak) karakter karakter yazar."""
+    for ch in text:
+        sys.stdout.write(ch)
+        sys.stdout.flush()
+        time.sleep(TYPE_DELAY)
+    print("\n")
+
+
+def save_test_block(title, entries, gen_params):
+    """entries: [(prompt, output), ...]. Dosyanın SONUNA, Word'deki formatla
+    birebir aynı düzende (başlık -> parametreler -> Inputs/Outputs) ekler."""
+    with open(TEST_LOG_FILE, 'a', encoding='utf-8') as f:
+        f.write(f"{title}\n\n")
+        f.write(f"MAX_NEW_TOKENS = {gen_params['max_new_tokens']}\n")
+        f.write(f"TEMPERATURE = {gen_params['temperature']}\n")
+        f.write(f"TOP_K = {gen_params['top_k']}\n")
+        f.write(f"TOP_P = {gen_params['top_p']}\n")
+        f.write(f"REPETITION_PENALTY = {gen_params['repetition_penalty']}\n\n")
+        f.write("Outputs :\n\n")
+        for prompt, output in entries:
+            f.write(f">> Text: {prompt}\n\n")
+            f.write(f">> {output}\n\n")
+        f.write("=" * 70 + "\n\n")
+
+
+# --- MODEL YÜKLEME ---
 model = BigramLanguageModel().to(device)
 resolved_model_path = resolve_pth_path(BEST_MODEL_PATH)
 state_dict = torch.load(resolved_model_path, map_location=device, weights_only=False)
-
-state_dict = { (k.replace('_orig_mod.', '') if k.startswith('_orig_mod.') else k): v
-               for k, v in state_dict.items() }
+state_dict = {(k.replace('_orig_mod.', '') if k.startswith('_orig_mod.') else k): v
+              for k, v in state_dict.items()}
 model.load_state_dict(state_dict)
 model.eval()
 
 print(f"\n[✓] Model yüklendi! ({BEST_MODEL_PATH})")
-print("Başlangıç metnini gir (Prompt), model devamını tamamlasın.")
-print("Çıkmak için 'exit' yazabilirsin.\n")
 
+# --- BURADAN AŞAĞISINI HER TEST TURUNDA SEN DEĞİŞTİRECEKSİN ---
 MAX_NEW_TOKENS = 40
 TEMPERATURE = 0.10
 TOP_K = 10
 TOP_P = 0.70
 REPETITION_PENALTY = 1.30
+# ----------------------------------------------------------------
+
+gen_params = dict(max_new_tokens=MAX_NEW_TOKENS, temperature=TEMPERATURE,
+                   top_k=TOP_K, top_p=TOP_P, repetition_penalty=REPETITION_PENALTY)
+
+test_mode = input("\nTest yapılacak mı? (e/h): ").strip().lower() in ("e", "evet", "y", "yes")
+
+if test_mode:
+    print(f"\n[TEST MODU] Sorular sorulacak, '{TEST_LOG_FILE}' dosyasına kaydedilecek.")
+    print("Komutlar: 'kaydet' -> şu ana kadarki soruları başlıkla kaydet | 'exit' -> çıkış\n")
+else:
+    print("\nBaşlangıç metnini gir (Prompt), model devamını tamamlasın.")
+    print("Çıkmak için 'exit' yazabilirsin.\n")
+
+entries_buffer = []  # [(prompt, output), ...] - sadece test modunda dolduruluyor
 
 while True:
     try:
@@ -242,20 +261,42 @@ while True:
         break
 
     stripped = prompt.strip()
-    if stripped.lower() in ("exit", "quit", "q"):
+    low = stripped.lower()
+
+    if low in ("exit", "quit", "q"):
+        if test_mode and entries_buffer:
+            confirm = input(f"[UYARI] {len(entries_buffer)} soru henüz kaydedilmedi. "
+                             f"Kaydetmeden çıkılsın mı? (e/h): ").strip().lower()
+            if confirm not in ("e", "evet", "y", "yes"):
+                continue
         break
+
+    if test_mode and low == "kaydet":
+        if not entries_buffer:
+            print("[i] Kaydedilecek soru yok, önce en az bir soru sor.\n")
+            continue
+        title = input("Başlık: ").strip()
+        save_test_block(title, entries_buffer, gen_params)
+        print(f"[✓] '{title}' başlığıyla {len(entries_buffer)} soru '{TEST_LOG_FILE}' dosyasına eklendi.\n")
+        entries_buffer = []
+        continue
 
     if not stripped:
         continue
 
-    print(f"\n>> {prompt}", end="")
-    sys.stdout.flush()
-
-    model.complete_text(
-        prompt,
+    output_text = model.complete_text(
+        stripped,
         max_new_tokens=MAX_NEW_TOKENS,
         temperature=TEMPERATURE,
         top_k=TOP_K,
         top_p=TOP_P,
         repetition_penalty=REPETITION_PENALTY,
     )
+
+    # Prompt'la üretilen metin arasına, kelimeler birbirine yapışmasın diye
+    # gerekiyorsa bir boşluk koy (GPT-2 demo'da da prompt+devam tek akış gibi görünür)
+    needs_space = stripped and not stripped.endswith((' ', '\n')) and not output_text.startswith((' ', '\n', ',', '.', '!', '?'))
+    stream_print((" " if needs_space else "") + output_text)
+
+    if test_mode:
+        entries_buffer.append((stripped, output_text))

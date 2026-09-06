@@ -2,27 +2,6 @@
 prepare_data.py
 ================
 Günlük/modern İngilizce dil verisi hazırlama - KADEMELİ (stage) sürekli eğitim için.
-
-MANTIK:
-  - Her stage'de her kaynaktan DAHA ÖNCE ÇEKİLMEMİŞ yeni dokümanlar indirilir
-    (state dosyası hangi noktada kaldığını hatırlar, tekrar indirmez).
-  - O ana kadarki TÜM stage'lerin verisi birleştirilip DOKÜMAN SEVİYESİNDE
-    yeniden karıştırılır (shuffle) ve main.py'nin okuyacağı tek dosyaya yazılır.
-  - Yani "önceki + yeni" mantığını script otomatik sağlıyor; main.py'ye her
-    seferinde SADECE büyümüş kümülatif dosyayı gösteriyorsunuz.
-
-KULLANIM (Kaggle notebook hücresinde):
-    !pip install "datasets<4.0.0" --quiet
-    !python prepare_data.py --stage 1 --target_tokens 200_000_000
-    # main.py'yi çalıştırıp stage 1'i eğitin, sonra:
-    !python prepare_data.py --stage 2 --target_tokens 200_000_000
-    # main.py'yi TEKRAR çalıştırın (checkpoint'ten devam eder) ...
-
-ÖNEMLİ - datasets kütüphanesi sürümü:
-    Hugging Face `datasets` v4.0+ eski "script tabanlı" veri setlerini artık
-    desteklemiyor (bookcorpusopen, cc_news, open_subtitles gibi). Bu yüzden
-    `datasets<4.0.0` kurmanız gerekiyor. openwebtext (parquet formatında)
-    yeni sürümde de çalışır ama tutarlılık için hepsini eski sürümle çekin.
 """
 
 import os, json, random, re, argparse
@@ -30,22 +9,19 @@ from datasets import load_dataset
 
 OUT_DIR = "datasets"
 STATE_FILE = os.path.join(OUT_DIR, "prepare_state.json")
-FINAL_FILE = os.path.join(OUT_DIR, "huge_mixed_gutenberg.txt")  # main.py'deki DATA_FILE ile AYNI isim/yol olmalı
+FINAL_FILE = os.path.join(OUT_DIR, "huge_mixed_gutenberg.txt")
 STAGE_DIR = os.path.join(OUT_DIR, "stages")
 
-# Günlük/konuşma diline ağırlık veren karışım oranları.
-# opensubtitles indirilemezse (bkz. aşağıdaki try/except) payı otomatik
-# openwebtext'e aktarılır, script durmaz.
 SOURCE_WEIGHTS = {
-    "opensubtitles": 0.30,   # gerçek diyalog -> en "günlük" kaynak
-    "openwebtext":   0.35,   # blog/forum/makale -> doğal, güncel yazı dili
-    "bookcorpus":    0.25,   # modern roman anlatısı + diyalog
-    "cc_news":       0.10,   # haber dili -> resmi kayıt için az miktarda
+    "opensubtitles": 0.55,   # OpenOrca (Diyalog / Soru-Cevap / Sohbet)
+    "bookcorpus":    0.03,   # emozilla/pg19 (Klasik Romanlar)
+    "openwebtext":   0.22,   
+    "cc_news":       0.20,   
 }
 
-WORD_TO_TOKEN_RATIO = 1.3  # BPE için kaba tahmin; gerçek sayıyı main.py tokenize ederken görürsünüz
+WORD_TO_TOKEN_RATIO = 1.3  
 MIN_DOC_CHARS = 20
-PROGRESS_EVERY_WORDS = 2_000_000  # her 2M kelimede bir ilerleme yazdır
+PROGRESS_EVERY_WORDS = 2_000_000  
 
 
 def clean_doc(text: str) -> str:
@@ -67,52 +43,34 @@ def save_state(state):
 
 
 def stream_docs(name):
-    """İlgili kaynak için streaming iterator döner (tüm veri diske inmez, akış halinde okunur)."""
+    """İlgili kaynak için streaming iterator döner."""
     if name == "openwebtext":
         ds = load_dataset("Skylion007/openwebtext", split="train", streaming=True)
         return (ex["text"] for ex in ds)
+        
     if name == "bookcorpus":
-        ds = load_dataset("bookcorpusopen", split="train", streaming=True, trust_remote_code=True)
+        ds = load_dataset("emozilla/pg19", split="train", streaming=True)
         return (ex["text"] for ex in ds)
+        
     if name == "cc_news":
-        # Not: 'cc_news' (namespace'siz) artık yeni huggingface_hub ile çalışmıyor
-        # ("Invalid HF URI... namespace/name" hatası). Namespace'li parquet
-        # kopyasını kullanıyoruz - script gerekmiyor, daha da sağlam.
         ds = load_dataset("vblagoje/cc_news", split="train", streaming=True)
         return (ex["text"] for ex in ds)
+        
     if name == "opensubtitles":
-        ds = load_dataset("open_subtitles", lang1="en", lang2="tr", split="train",
-                           streaming=True, trust_remote_code=True)
-        return _group_subtitle_lines(ex["translation"]["en"] for ex in ds)
+        ds = load_dataset("Open-Orca/OpenOrca", split="train", streaming=True)
+        return (f"{ex['question']} {ex['response']}" for ex in ds)
+        
     raise ValueError(name)
 
 
-def _group_subtitle_lines(line_iter, group_size=25):
-    """OpenSubtitles tek tek satır (~5-10 kelime) veriyor; bunları MIN_DOC_CHARS
-    filtresinden geçebilecek ve daha bağlamlı olacak şekilde N'li gruplar
-    halinde birleştirip tek 'doküman' olarak veriyoruz."""
-    buf = []
-    for line in line_iter:
-        line = line.strip()
-        if line:
-            buf.append(line)
-        if len(buf) >= group_size:
-            yield " ".join(buf)
-            buf = []
-    if buf:
-        yield " ".join(buf)
-
-
 def collect_target_tokens(name, target_tokens, skip):
-    """`skip` kadar dokümanı atlar (önceki stage'lerde zaten kullanıldı),
-    ardından hedef token sayısına ulaşana kadar yeni doküman toplar.
-    Kaynak veri biterse (StopIteration), toplanan ne varsa onunla döner -
-    eksik kalan miktarı çağıran taraf başka kaynaklara aktarır."""
+    """Hedef token sayısına ulaşana kadar yeni doküman toplar."""
     target_words = int(target_tokens / WORD_TO_TOKEN_RATIO)
     docs, collected_words, n_consumed = [], 0, skip
     last_report = 0
     exhausted = False
     it = stream_docs(name)
+    
     for i, doc in enumerate(it):
         if i < skip:
             continue
@@ -128,7 +86,7 @@ def collect_target_tokens(name, target_tokens, skip):
         if collected_words >= target_words:
             break
     else:
-        exhausted = True  # for-else: break olmadan biterse kaynak tükenmiş demektir
+        exhausted = True  
 
     if exhausted and collected_words < target_words:
         print(f"  [UYARI] '{name}' kaynağı tükendi, hedefin altında kaldı "
@@ -145,18 +103,15 @@ def main():
     os.makedirs(STAGE_DIR, exist_ok=True)
     state = load_state()
 
+    # --- 1. AŞAMA: TALEP EDİLEN STAGE VERİSİNİ ÇEKME & KAYDETME ---
     if args.stage in state["completed_stages"]:
-        print(f"[UYARI] Stage {args.stage} zaten tamamlanmış, yeniden indirilmeyecek. "
-              f"Mevcut tüm stage'ler birleştirilip {FINAL_FILE} yeniden yazılacak.")
+        print(f"[UYARI] Stage {args.stage} zaten tamamlanmış görünüyor. İndirme atlanıyor.")
     else:
-        print(f"=== STAGE {args.stage}: hedef {args.target_tokens:,} token ===")
+        print(f"=== STAGE {args.stage}: hedef ~{args.target_tokens:,} token ===")
         stage_docs = []
-        remaining_sources = dict(SOURCE_WEIGHTS)   # her turda tükenmeyenler kalır
-        pending_tokens = args.target_tokens        # henüz karşılanmamış toplam hedef
+        remaining_sources = dict(SOURCE_WEIGHTS)   
+        pending_tokens = args.target_tokens        
 
-        # En fazla len(SOURCE_WEIGHTS) tur atılır: her turda bir kaynak ya
-        # hedefini tam karşılar ya da tükenip devre dışı kalır; kalan pay
-        # bir sonraki turda hâlâ aktif olan kaynaklara yeniden dağıtılır.
         for _ in range(len(SOURCE_WEIGHTS)):
             if not remaining_sources or pending_tokens <= 0:
                 break
@@ -179,7 +134,7 @@ def main():
                 stage_docs.extend(docs)
                 state[source] = new_skip
                 pending_tokens -= int(got_words * WORD_TO_TOKEN_RATIO)
-                if got_words < target_words:   # kaynak tükendi, bir daha denemeye gerek yok
+                if got_words < target_words:   
                     exhausted_this_round.append(source)
 
             for source in exhausted_this_round:
@@ -193,32 +148,39 @@ def main():
         with open(stage_path, "w", encoding="utf-8") as f:
             for doc in stage_docs:
                 f.write(doc + "\n")
-        print(f"[OK] Stage {args.stage} kaydedildi -> {stage_path} ({len(stage_docs):,} doküman)")
+        print(f"[OK] Stage {args.stage} indirildi ve kaydedildi -> {stage_path} ({len(stage_docs):,} doküman)")
 
         state["completed_stages"].append(args.stage)
         save_state(state)
 
-    # --- Tamamlanmış TÜM stage'leri birleştir + yeniden karıştır (kümülatif veri) ---
+    # --- 2. AŞAMA: TÜM STAGELERİ OKUMA, KARIŞTIRMA VE BİRLEŞTİRME ---
+    print("\n=== Tüm Stage'ler Birleştiriliyor ve Karıştırılıyor ===")
     all_docs = []
-    for s in sorted(state["completed_stages"]):
+    
+    # Disk üzerindeki mevcut tüm stage_XX.txt dosyalarını bulup oku
+    existing_stages = sorted(state["completed_stages"])
+    for s in existing_stages:
         path = os.path.join(STAGE_DIR, f"stage_{s:02d}.txt")
-        with open(path, encoding="utf-8") as f:
-            all_docs.extend(line.rstrip("\n") for line in f if line.strip())
+        if os.path.exists(path):
+            print(f"  -> {path} yükleniyor...")
+            with open(path, encoding="utf-8") as f:
+                all_docs.extend(line.rstrip("\n") for line in f if line.strip())
 
+    # Bütün veriyi global olarak karıştır
+    print(f"  -> Toplam {len(all_docs):,} doküman karma yapılıyor (random.shuffle)...")
     random.shuffle(all_docs)
+
+    # Karıştırılmış veriyi nihai dosyaya yaz
     os.makedirs(os.path.dirname(FINAL_FILE), exist_ok=True)
     with open(FINAL_FILE, "w", encoding="utf-8") as f:
         for doc in all_docs:
             f.write(doc + "\n")
 
     total_words = sum(len(d.split()) for d in all_docs)
-    print(f"\n[OK] Kümülatif veri hazır -> {FINAL_FILE}")
-    print(f"     Doküman: {len(all_docs):,} | ~{total_words:,} kelime | "
-          f"~{int(total_words*WORD_TO_TOKEN_RATIO):,} token (tahmini)")
-    print("\n[SONRAKI ADIM] main.py'yi çalıştırmadan önce:")
-    print("  1) tokenizer_16k.json'a DOKUNMAYIN (vocab sabit kalmalı, yoksa embedding'ler bozulur)")
-    print("  2) tokenized_huge_10m.pt ve shards/ klasörünü SİLİN (yeni kümülatif veriyle yeniden tokenize etsin)")
-    print("  3) checkpoint.pth ve best_model.pth'a DOKUNMAYIN (kaldığı ağırlıklardan devam etsin)")
+    print(f"\n[BAŞARILI] Tüm veriler karıştırıldı -> {FINAL_FILE}")
+    print(f"           Toplam Doküman: {len(all_docs):,}")
+    print(f"           Toplam Kelime : ~{total_words:,}")
+    print(f"           Tahmini Token : ~{int(total_words*WORD_TO_TOKEN_RATIO):,}")
 
 
 if __name__ == "__main__":
